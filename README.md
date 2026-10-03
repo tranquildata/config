@@ -61,7 +61,7 @@ func getWebConfig(service config.Service) (*WebConfig, error) {
 }
 ```
 
-The `Service` resolves each field value using the available property sources as described above. It validates the names and the expected types, fills-in the optional default values as-needed, and tracks which properties are visible or hidden. When it finds a struct tagged with `config:""` it recurses to fill-in that structure too, and it leaves untagged structs like `tls.Config` alone.
+The `Service` resolves each field value using the available property sources as described above. It validates the names and the expected types, fills-in the optional default values as-needed, and tracks which properties are visible or hidden. When it finds a struct tagged with `config` it recurses to fill-in that structure too, and it leaves untagged structs like `tls.Config` alone.
 
 If `LoadConfig()` doesn't return an error then the config structure has been filled-in with the correct, validated values. As you load structs, you now have a place to retrieve the full, running configuration state:
 
@@ -80,11 +80,25 @@ Base types are `string`, `bool`, all int types, all unsigned int types, all floa
 
 Slices are separated using semicolons. A slice may have zero or more entries.
 
-A struct field can be another struct, or a pointer to another struct. If the field is exported and tagged with an empty `config:""` tag, it will be recursively loaded. This makes it easy to share common configuration elements across component-specific definitions. An untagged struct field is ignored, so config structs can hold third-party types like `tls.Config` without them being touched. If an untagged struct field's type has its own tagged fields, though, it was most likely meant to be loaded, so an error is raised. Tag the field `config:"-"` to skip it on purpose. Struct fields (other than the base types like `time.Time`) may not be tagged with a property name, or with `hiddenconfig`.
+A struct field can be another struct, or a pointer to another struct. If the field is exported and tagged with `config`, it will be recursively loaded. This makes it easy to share common configuration elements across component-specific definitions. An untagged struct field is ignored, so config structs can hold third-party types like `tls.Config` without them being touched. If an untagged struct field's type has its own tagged fields, though, it was most likely meant to be loaded, so an error is raised. Tag the field `config:"-"` to skip it on purpose. Struct fields (other than the base types like `time.Time`) may not be tagged with a default value, or with `hiddenconfig`.
+
+A struct field's tag may name a prefix, which is prepended to the property name of every field in that struct. This lets one struct be used in several places under different names. Prefixes accumulate through nested structs, and an empty tag, `config:""`, adds no prefix:
+
+```go
+type PostgresConfig struct {
+    Port int    `config:"postgresPort,5432"`
+    Host string `config:"postgresHost"`
+}
+
+type StoreConfig struct {
+    Context PostgresConfig `config:"context"` // contextPostgresPort, contextPostgresHost
+    Index   PostgresConfig `config:"index"`   // indexPostgresPort, indexPostgresHost
+}
+```
 
 The `config` tag identifies a field that should be loaded. The `hiddenconfig` tag does exactly the same thing, only marking the field as hidden. Any field without a tag is ignored. An error is raised if an un-exported field is tagged.
 
-Naming schemes serve two purposes: they ensure consistency across all property names, and they split property names to generate other forms at runtime (like creating the environment variable format of a configuration property name). The library currently includes support for `Camel`, `Snake`, and `Kebab` schemes, and makes it simple to integrate additional naming schemes as-needed.
+Naming schemes serve two purposes: they ensure consistency across all property names, and they split and join the words in property names to generate other forms at runtime (like creating the environment variable format of a configuration property name, or prepending a struct's prefix). The library currently includes support for `Camel`, `Snake`, and `Kebab` schemes, and makes it simple to integrate additional naming schemes as-needed.
 
 ## Providers ##
 
@@ -108,4 +122,5 @@ To get you started, here are a few areas that we would like to build (or see con
 * Provider implementations for file formats that support nested structure to generate hierarchical property names
 * Provider implementations for common online sources of configuration
 * Support for validating Enums (Golang doesn't have a native Enum type, so we haven't tried to generalize this one yet)
-* Support for additional base types that are useful in typical configurations like `LDAP` or `DNS` Names 
+* Support for additional base types that are useful in typical configurations like `LDAP` or `DNS` Names
+* Detection of conflicting property declarations. Today, if two fields declare the same property name (for instance, the same struct used in two places without a prefix), the field values are populated correctly, but only one entry is kept in the reported properties. That's harmless when the declarations agree, but if they have different default values the reported value may not match the one a field is using, and if one is `config` and the other `hiddenconfig` then the hidden value is reported as visible. This case might raise an error when declarations of the same name disagree on their default value or visibility, both within a single `LoadConfig()` call and across calls to the same `Service`.

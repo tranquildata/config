@@ -20,42 +20,50 @@ const (
 
 type SplitFunction func(string) []string
 
+type ComposeFunction func([]string) string
+
 // namingScheme is a private utility that is used for all of the naming schemes.
 type namingScheme struct {
-	compiled      *regexp.Regexp
-	splitFunction SplitFunction
+	compiled        *regexp.Regexp
+	splitFunction   SplitFunction
+	composeFunction ComposeFunction
 }
 
 // CamelNamingScheme returns a NamingScheme that validates and enforces the CAMEL style
 // of naming: "eachWordLikeThis". When a name is split by this NamingScheme, runs of
 // upper-case characters are kept together. For instance, the name "maxHTTPConnections"
-// would become ["max", "HTTP", "Connections"].
+// would become ["max", "HTTP", "Connections"]. When names are composed, the first word is
+// kept as-is and each following word starts with an upper-case character. For instance,
+// ["index", "postgres", "Port"] would become "indexPostgresPort".
 func CamelNamingScheme() NamingScheme {
 	return &namingScheme{
-		compiled:      regexp.MustCompile(CamelCaseExpression),
-		splitFunction: camelSplit,
+		compiled:        regexp.MustCompile(CamelCaseExpression),
+		splitFunction:   camelSplit,
+		composeFunction: camelCompose,
 	}
 }
 
 // SnakeNamingScheme returns a NamingScheme that validates and enforces the SNAKE style
 // of naming: "each_word_like_this". When a name is split by this NamingScheme, all
 // underscores are dropped. For instance, the name "cache_size" would become ["cache",
-// "size"].
+// "size"]. When names are composed, the words are joined with underscores.
 func SnakeNamingScheme() NamingScheme {
 	return &namingScheme{
-		compiled:      regexp.MustCompile(SnakeCaseExpression),
-		splitFunction: snakeSplit,
+		compiled:        regexp.MustCompile(SnakeCaseExpression),
+		splitFunction:   snakeSplit,
+		composeFunction: snakeCompose,
 	}
 }
 
 // KebabNamingScheme returns a NamingScheme that validates and enforces the KEBAB style
 // of naming: "each-word-like-this". When a name is split by this NamingScheme, all
 // dashes are dropped. For instance, the name "cache-size" would become ["cache",
-// "size"].
+// "size"]. When names are composed, the words are joined with dashes.
 func KebabNamingScheme() NamingScheme {
 	return &namingScheme{
-		compiled:      regexp.MustCompile(KebabCaseExpression),
-		splitFunction: kebabSplit,
+		compiled:        regexp.MustCompile(KebabCaseExpression),
+		splitFunction:   kebabSplit,
+		composeFunction: kebabCompose,
 	}
 }
 
@@ -63,6 +71,10 @@ func KebabNamingScheme() NamingScheme {
 
 func (ns *namingScheme) Components(propertyName string) []string {
 	return ns.splitFunction(propertyName)
+}
+
+func (ns *namingScheme) Compose(components []string) string {
+	return ns.composeFunction(components)
 }
 
 func (ns *namingScheme) Validate(propertyName string) error {
@@ -105,4 +117,29 @@ func snakeSplit(propertyName string) []string {
 
 func kebabSplit(propertyName string) []string {
 	return strings.Split(propertyName, "-")
+}
+
+/* Implement static compose functions */
+
+func camelCompose(components []string) string {
+	var builder strings.Builder
+	for i, component := range components {
+		// every word after the first starts with an upper-case character, and the rest of
+		// the word keeps its case so that runs of capitals like "HTTP" are preserved
+		if i > 0 && len(component) > 0 {
+			runes := []rune(component)
+			runes[0] = unicode.ToUpper(runes[0])
+			component = string(runes)
+		}
+		builder.WriteString(component)
+	}
+	return builder.String()
+}
+
+func snakeCompose(components []string) string {
+	return strings.Join(components, "_")
+}
+
+func kebabCompose(components []string) string {
+	return strings.Join(components, "-")
 }

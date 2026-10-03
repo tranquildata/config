@@ -16,6 +16,14 @@ type NamingScheme interface {
 	// callers should use Validate() first if the name has not already been checked.
 	Components(propertyName string) []string
 
+	// Compose joins words into a single property name in the style of this scheme. It is the
+	// inverse of Components(), so composing the components of a valid name returns that name,
+	// and it is used to form names from parts, such as prepending a prefix to a name. For
+	// instance, the CAMEL scheme composes ["index", "postgres", "Port"] into the name
+	// "indexPostgresPort". The result is not validated, so callers should use Validate() if
+	// the words did not all come from valid names.
+	Compose(components []string) string
+
 	// Validate returns an error if the property name is not valid for this scheme.
 	Validate(propertyName string) error
 }

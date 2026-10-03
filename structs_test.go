@@ -8,7 +8,9 @@ import (
 	"crypto/tls"
 	"errors"
 	"log"
+	"maps"
 	"net/url"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -641,14 +643,20 @@ func Test_populateSkippedStruct(t *testing.T) {
 
 func Test_populateInvalidStructTag(t *testing.T) {
 	cases := map[string]any{
-		"name": &struct {
-			Inner innerConfig `config:"inner"`
-		}{},
 		"default": &struct {
 			Inner innerConfig `config:",value"`
 		}{},
-		"pointer": &struct {
-			Inner *innerConfig `config:"inner"`
+		"prefixed-default": &struct {
+			Inner innerConfig `config:"inner,value"`
+		}{},
+		"empty-default": &struct {
+			Inner innerConfig `config:"inner,"`
+		}{},
+		"pointer-default": &struct {
+			Inner *innerConfig `config:"inner,value"`
+		}{},
+		"skip-default": &struct {
+			Inner innerConfig `config:"-,value"`
 		}{},
 		"hidden": &struct {
 			Inner innerConfig `hiddenconfig:""`
@@ -667,9 +675,181 @@ func Test_populateInvalidStructTag(t *testing.T) {
 
 		if visible, hidden, err := PopulateStruct(config, provider, scheme); err == nil {
 			t.Errorf("expected an error for a struct tagged with %s", name)
+		} else if strings.Contains(name, "default") && !strings.Contains(err.Error(), "cannot have a default value") {
+			t.Errorf("unexpected error for a struct tagged with %s: %v", name, err)
 		} else if visible != nil || hidden != nil {
 			t.Errorf("expected no properties for a struct tagged with %s", name)
 		}
+	}
+}
+
+type postgresConfig struct {
+	Port     int    `config:"postgresPort,5432"`
+	Host     string `config:"postgresHost"`
+	Password string `hiddenconfig:"postgresPassword"`
+}
+
+func Test_populatePrefixedStructs(t *testing.T) {
+	provider := MapProvider(map[string]string{
+		"contextPostgresHost":     "context.example.com",
+		"indexPostgresHost":       "index.example.com",
+		"indexPostgresPort":       "6543",
+		"indexPostgresPassword":   "secret",
+		"postgresHost":            "unprefixed.example.com",
+		"contextPostgresPassword": "other",
+	})
+
+	// the same struct type is used under different prefixes, by value and by pointer, and
+	// with an empty tag for no prefix, so each property name is distinct
+	config := &struct {
+		Context    postgresConfig  `config:"context"`
+		Index      *postgresConfig `config:"index"`
+		Unprefixed postgresConfig  `config:""`
+	}{}
+	if visible, hidden, err := PopulateStruct(config, provider, CamelNamingScheme()); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	} else if config.Context.Host != "context.example.com" || config.Context.Port != 5432 || config.Context.Password != "other" {
+		t.Errorf("unexpected context config: %+v", config.Context)
+	} else if config.Index == nil || config.Index.Host != "index.example.com" || config.Index.Port != 6543 || config.Index.Password != "secret" {
+		t.Errorf("unexpected index config: %+v", config.Index)
+	} else if config.Unprefixed.Host != "unprefixed.example.com" || config.Unprefixed.Port != 5432 {
+		t.Errorf("unexpected unprefixed config: %+v", config.Unprefixed)
+	} else if !maps.Equal(visible, map[string]string{
+		"contextPostgresHost": "context.example.com", "contextPostgresPort": "5432",
+		"indexPostgresHost": "index.example.com", "indexPostgresPort": "6543",
+		"postgresHost": "unprefixed.example.com", "postgresPort": "5432",
+	}) {
+		t.Errorf("unexpected visible properties: %v", visible)
+	} else if !maps.Equal(hidden, map[string]string{"contextPostgresPassword": "other", "indexPostgresPassword": "secret"}) {
+		t.Errorf("unexpected hidden properties: %v", hidden)
+	}
+}
+
+func Test_populateNestedPrefixes(t *testing.T) {
+	provider := MapProvider(map[string]string{"contextStorePrimaryPostgresPort": "1", "contextCacheSize": "2", "contextName": "app"})
+
+	// prefixes accumulate through nested struct fields, and an empty tag adds nothing to the
+	// prefix that is already in place
+	type cacheConfig struct {
+		Size int `config:"size"`
+	}
+	type storeConfig struct {
+		Primary postgresConfig `config:"primary"`
+	}
+	config := &struct {
+		Context struct {
+			Name  string      `config:"name"`
+			Store storeConfig `config:"store"`
+			Cache struct {
+				Inner cacheConfig `config:"cache"`
+			} `config:""`
+		} `config:"context"`
+	}{}
+	if visible, _, err := PopulateStruct(config, provider, CamelNamingScheme()); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	} else if config.Context.Name != "app" || config.Context.Store.Primary.Port != 1 || config.Context.Cache.Inner.Size != 2 {
+		t.Errorf("unexpected populated struct: %+v", *config)
+	} else if !maps.Equal(visible, map[string]string{"contextName": "app", "contextStorePrimaryPostgresPort": "1", "contextCacheSize": "2"}) {
+		t.Errorf("unexpected visible properties: %v", visible)
+	}
+}
+
+func Test_populatePrefixSchemes(t *testing.T) {
+	cases := map[string]struct {
+		scheme   NamingScheme
+		prefix   string
+		name     string
+		expected string
+	}{
+		"camel":         {CamelNamingScheme(), "index", "postgresPort", "indexPostgresPort"},
+		"camel-acronym": {CamelNamingScheme(), "maxHTTP", "port", "maxHTTPPort"},
+		"snake":         {SnakeNamingScheme(), "index", "postgres_port", "index_postgres_port"},
+		"kebab":         {KebabNamingScheme(), "index", "postgres-port", "index-postgres-port"},
+		"custom":        {dottedScheme{}, "index", "postgres.port", "index.postgres.port"},
+	}
+	for name, testCase := range cases {
+		// the struct tags are built at runtime so that each scheme gets names that are valid
+		inner := reflect.StructOf([]reflect.StructField{{
+			Name: "Port", Type: reflect.TypeFor[int](), Tag: reflect.StructTag(`config:"` + testCase.name + `"`),
+		}})
+		outer := reflect.StructOf([]reflect.StructField{{
+			Name: "Inner", Type: inner, Tag: reflect.StructTag(`config:"` + testCase.prefix + `"`),
+		}})
+		config := reflect.New(outer)
+
+		provider := MapProvider(map[string]string{testCase.expected: "42"})
+		if visible, _, err := PopulateStruct(config.Interface(), provider, testCase.scheme); err != nil {
+			t.Errorf("unexpected error for %s: %v", name, err)
+		} else if port := config.Elem().Field(0).Field(0).Int(); port != 42 {
+			t.Errorf("unexpected port for %s: %d", name, port)
+		} else if !maps.Equal(visible, map[string]string{testCase.expected: "42"}) {
+			t.Errorf("unexpected properties for %s: %v", name, visible)
+		}
+	}
+}
+
+func Test_populateInvalidPrefix(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	provider := mocks.NewMockProvider(ctrl)
+
+	// the prefix must be a valid name on its own
+	if _, _, err := PopulateStruct(&struct {
+		Inner innerConfig `config:"Index"`
+	}{}, provider, CamelNamingScheme()); err == nil {
+		t.Error("expected an error for an invalid prefix")
+	}
+	if _, _, err := PopulateStruct(&struct {
+		Inner innerConfig `config:"index_store"`
+	}{}, provider, CamelNamingScheme()); err == nil {
+		t.Error("expected an error for a prefix in the wrong scheme")
+	}
+}
+
+func Test_populateInvalidComposedName(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	provider := mocks.NewMockProvider(ctrl)
+
+	// the composed name is validated too, since a custom scheme may compose valid names into
+	// one that isn't valid
+	scheme := mocks.NewMockNamingScheme(ctrl)
+	scheme.EXPECT().Validate("index").Return(nil)
+	scheme.EXPECT().Validate("host").Return(nil)
+	scheme.EXPECT().Components("index").Return([]string{"index"})
+	scheme.EXPECT().Components("host").Return([]string{"host"})
+	scheme.EXPECT().Compose([]string{"index", "host"}).Return("index!host")
+	scheme.EXPECT().Validate("index!host").Return(errors.New("invalid"))
+
+	if visible, hidden, err := PopulateStruct(&struct {
+		Inner innerConfig `config:"index"`
+	}{}, provider, scheme); err == nil {
+		t.Error("expected an error for an invalid composed name")
+	} else if visible != nil || hidden != nil {
+		t.Error("expected no properties for an invalid composed name")
+	}
+}
+
+func Test_populatePrefixedInvalidValue(t *testing.T) {
+	provider := MapProvider(map[string]string{"indexPostgresPort": "eighty", "contextPostgresPassword": "s3cr3t-value"})
+
+	// a struct used in several places has the same field names in each, so errors report
+	// the property name to show which use of the struct failed
+	if _, _, err := PopulateStruct(&struct {
+		Index postgresConfig `config:"index"`
+	}{}, provider, CamelNamingScheme()); err == nil {
+		t.Error("expected an error for an invalid value")
+	} else if !strings.Contains(err.Error(), "indexPostgresPort") {
+		t.Errorf("expected the property name in the error: %v", err)
+	}
+
+	type intConfig struct {
+		Password int `hiddenconfig:"postgresPassword"`
+	}
+	if _, _, err := PopulateStruct(&struct {
+		Context intConfig `config:"context"`
+	}{}, provider, CamelNamingScheme()); err == nil {
+		t.Error("expected an error for an invalid hidden value")
+	} else if !strings.Contains(err.Error(), "contextPostgresPassword") || strings.Contains(err.Error(), "s3cr3t-value") {
+		t.Errorf("unexpected error for an invalid hidden value: %v", err)
 	}
 }
 
