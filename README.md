@@ -33,6 +33,7 @@ Define structs that the `Service` can automatically populate:
 
 ```go
 import (
+    "crypto/tls"
     "net/url"
     "github.com/tranquildata/config"
 )
@@ -43,7 +44,8 @@ type WebConfig struct {
     Port            PortType       `config:"httpPort"`
     Endpoint        url.URL        `config:"httpEndpoint,https://localhost/webapp"`
     UseNewTransport bool           `hiddenconfig:"useNewTransport,false"`
-    Security        SecurityConfig
+    Security        SecurityConfig `config:""`
+    TLS             *tls.Config
 }
 
 type SecurityConfig struct {
@@ -59,7 +61,7 @@ func getWebConfig(service config.Service) (*WebConfig, error) {
 }
 ```
 
-The `Service` resolves each field value using the available property sources as described above. It validates the names and the expected types, fills-in the optional default values as-needed, and tracks which properties are visible or hidden. When it finds a struct it recurses to fill-in that structure too.
+The `Service` resolves each field value using the available property sources as described above. It validates the names and the expected types, fills-in the optional default values as-needed, and tracks which properties are visible or hidden. When it finds a struct tagged with `config:""` it recurses to fill-in that structure too, and it leaves untagged structs like `tls.Config` alone.
 
 If `LoadConfig()` doesn't return an error then the config structure has been filled-in with the correct, validated values. As you load structs, you now have a place to retrieve the full, running configuration state:
 
@@ -74,13 +76,13 @@ func getProperties(service config.Service, includeHidden bool) map[string]string
 
 ## Supported Structure ##
 
-Base types are `string`, `bool`, all int types, all unsigned int types, all float types, `time.Time`, `time.Duration`, and `url.URL`. Any field that is one of these types, a custom type that is defined as one of these types, or a slice of one of these types is supported. Fields may not use pointers to base types, like `*string`.
+Base types are `string`, `bool`, all int types, all unsigned int types, all float types, `time.Time`, `time.Duration`, and `url.URL`. Any field that is one of these types, a custom type that is defined as one of these types, or a slice of one of these types is supported. Tagged fields may not use pointers to base types, like `*string`.
 
 Slices are separated using semicolons. A slice may have zero or more entries.
 
-A struct field can be another struct, or a pointer to another struct. As long as the field is exported, it will be recursively loaded. This makes it easy to share common configuration elements across component-specific definitions. A struct field (other than the base types like `time.Time`) should not be tagged.
+A struct field can be another struct, or a pointer to another struct. If the field is exported and tagged with an empty `config:""` tag, it will be recursively loaded. This makes it easy to share common configuration elements across component-specific definitions. An untagged struct field is ignored, so config structs can hold third-party types like `tls.Config` without them being touched. If an untagged struct field's type has its own tagged fields, though, it was most likely meant to be loaded, so an error is raised. Tag the field `config:"-"` to skip it on purpose. Struct fields (other than the base types like `time.Time`) may not be tagged with a property name, or with `hiddenconfig`.
 
-The `config` tag identifies a field that should be loaded. The `hiddenconfig` tag does exactly the same thing, only marking the field as hidden. Any field without a tag is ignored, except exported struct fields, which are loaded recursively. An error is raised if an un-exported field is tagged.
+The `config` tag identifies a field that should be loaded. The `hiddenconfig` tag does exactly the same thing, only marking the field as hidden. Any field without a tag is ignored. An error is raised if an un-exported field is tagged.
 
 Naming schemes serve two purposes: they ensure consistency across all property names, and they split property names to generate other forms at runtime (like creating the environment variable format of a configuration property name). The library currently includes support for `Camel`, `Snake`, and `Kebab` schemes, and makes it simple to integrate additional naming schemes as-needed.
 

@@ -5,6 +5,7 @@
 package config
 
 import (
+	"crypto/tls"
 	"errors"
 	"log"
 	"net/url"
@@ -60,9 +61,9 @@ type innerConfig struct {
 }
 
 type nestedConfig struct {
-	Name    string `config:"name"`
-	Inner   innerConfig
-	Pointer *innerConfig
+	Name    string       `config:"name"`
+	Inner   innerConfig  `config:""`
+	Pointer *innerConfig `config:""`
 }
 
 type hiddenConfig struct {
@@ -73,9 +74,9 @@ type hiddenConfig struct {
 }
 
 type nestedHiddenConfig struct {
-	Name        string `config:"name"`
-	Credentials hiddenConfig
-	Pointer     *hiddenConfig
+	Name        string        `config:"name"`
+	Credentials hiddenConfig  `config:""`
+	Pointer     *hiddenConfig `config:""`
 }
 
 type processedConfig struct {
@@ -231,7 +232,7 @@ func Test_populateUntagged(t *testing.T) {
 	} else if config.Name != "app" {
 		t.Errorf("unexpected name: %q", config.Name)
 	} else if config.Untagged != "keep" || config.Blank != "keep" || config.OtherTags != "keep" {
-		t.Errorf("untagged fields were modified: %+v", *config)
+		t.Error("untagged fields were modified")
 	} else if len(resolved) != 1 || resolved["name"] != "app" {
 		t.Errorf("unexpected resolved properties: %v", resolved)
 	}
@@ -527,11 +528,158 @@ func Test_populateNested(t *testing.T) {
 	}
 }
 
+func Test_populateUntaggedStructSkipped(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	provider := mocks.NewMockProvider(ctrl)
+	scheme := mocks.NewMockNamingScheme(ctrl)
+
+	// untagged structs whose types expect no config handling are skipped without being
+	// inspected or allocated, as are untagged pointers of any kind, and self-referencing
+	// types are checked without recursing forever
+	type link struct {
+		Next *link
+	}
+	config := &struct {
+		TLS     tls.Config
+		Pointer *tls.Config
+		Link    link
+		String  *string
+		Nested  **innerConfig
+		Skipped struct {
+			Inner innerConfig `config:"-"`
+		}
+	}{}
+	if visible, hidden, err := PopulateStruct(config, provider, scheme); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	} else if config.TLS.RootCAs != nil || config.Pointer != nil || config.Link.Next != nil || config.String != nil || config.Nested != nil {
+		t.Error("untagged fields were modified")
+	} else if len(visible) != 0 || len(hidden) != 0 {
+		t.Errorf("unexpected properties: %v, %v", visible, hidden)
+	}
+}
+
+func Test_populateUntaggedStructExpectsConfig(t *testing.T) {
+	type Embedded struct {
+		Host string `config:"host"`
+	}
+	type node struct {
+		Name string `config:"name"`
+		Next *node
+	}
+	cases := map[string]any{
+		"struct": &struct {
+			Inner innerConfig
+		}{},
+		"pointer": &struct {
+			Inner *innerConfig
+		}{},
+		"hidden": &struct {
+			Credentials hiddenConfig
+		}{},
+		"embedded": &struct {
+			Embedded
+		}{},
+		"deep": &struct {
+			Outer struct {
+				Inner innerConfig
+			}
+		}{},
+		"opted-in": &struct {
+			Outer struct {
+				Inner struct{} `config:""`
+			}
+		}{},
+		"unexported": &struct {
+			Outer struct {
+				port int `config:"port"`
+			}
+		}{},
+		"self-referencing": &node{},
+	}
+	for name, config := range cases {
+		ctrl := gomock.NewController(t)
+		provider := mapProvider(ctrl, map[string]string{})
+		scheme := acceptingScheme(ctrl)
+
+		if visible, hidden, err := PopulateStruct(config, provider, scheme); err == nil {
+			t.Errorf("expected an error for an untagged %s struct", name)
+		} else if !strings.Contains(err.Error(), "is not tagged") {
+			t.Errorf("unexpected error for an untagged %s struct: %v", name, err)
+		} else if visible != nil || hidden != nil {
+			t.Errorf("expected no properties for an untagged %s struct", name)
+		}
+	}
+}
+
+func Test_populateSkippedStruct(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	provider := mocks.NewMockProvider(ctrl)
+	provider.EXPECT().Value("name").Return("app", true)
+	scheme := acceptingScheme(ctrl)
+
+	// skipped structs aren't populated even though their types expect config handling, and
+	// the skip directive is accepted on unexported fields since it can't be a mistake there
+	config := &struct {
+		Name     string        `config:"name"`
+		Inner    innerConfig   `config:"-"`
+		Pointer  *innerConfig  `config:" - "`
+		Hidden   hiddenConfig  `config:"-"`
+		inner    innerConfig   `config:"-"`
+		password string        `hiddenconfig:"-"`
+		Wrapped  *nestedConfig `config:"-"`
+	}{}
+	if visible, hidden, err := PopulateStruct(config, provider, scheme); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	} else if config.Name != "app" {
+		t.Errorf("unexpected name: %q", config.Name)
+	} else if config.Inner.Host != "" || config.Pointer != nil || config.Hidden.User != "" || config.Wrapped != nil {
+		t.Errorf("skipped fields were modified: %+v", *config)
+	} else if len(visible) != 1 || len(hidden) != 0 {
+		t.Errorf("unexpected properties: %v, %v", visible, hidden)
+	}
+}
+
+func Test_populateInvalidStructTag(t *testing.T) {
+	cases := map[string]any{
+		"name": &struct {
+			Inner innerConfig `config:"inner"`
+		}{},
+		"default": &struct {
+			Inner innerConfig `config:",value"`
+		}{},
+		"pointer": &struct {
+			Inner *innerConfig `config:"inner"`
+		}{},
+		"hidden": &struct {
+			Inner innerConfig `hiddenconfig:""`
+		}{},
+		"hidden-name": &struct {
+			Inner innerConfig `hiddenconfig:"inner"`
+		}{},
+		"hidden-skip": &struct {
+			Inner innerConfig `config:"-" hiddenconfig:"-"`
+		}{},
+	}
+	for name, config := range cases {
+		ctrl := gomock.NewController(t)
+		provider := mocks.NewMockProvider(ctrl)
+		scheme := mocks.NewMockNamingScheme(ctrl)
+
+		if visible, hidden, err := PopulateStruct(config, provider, scheme); err == nil {
+			t.Errorf("expected an error for a struct tagged with %s", name)
+		} else if visible != nil || hidden != nil {
+			t.Errorf("expected no properties for a struct tagged with %s", name)
+		}
+	}
+}
+
 func Test_populatePointerToBaseType(t *testing.T) {
 	cases := map[string]any{
-		"string": &struct{ V *string }{},
-		"tagged": &struct {
+		"string": &struct {
 			V *string `config:"v"`
+		}{},
+		"hidden": &struct {
+			V *string `hiddenconfig:"v"`
 		}{},
 		"int": &struct {
 			V *int `config:"v"`
@@ -548,7 +696,9 @@ func Test_populatePointerToBaseType(t *testing.T) {
 		"url": &struct {
 			V *url.URL `config:"v"`
 		}{},
-		"pointer": &struct{ V **innerConfig }{},
+		"pointer": &struct {
+			V **innerConfig `config:"v"`
+		}{},
 	}
 	for name, config := range cases {
 		ctrl := gomock.NewController(t)
@@ -622,7 +772,7 @@ func Test_populateNestedPostprocessor(t *testing.T) {
 	processor.EXPECT().Process().Return(nil)
 
 	config := &struct {
-		Processed processedConfig
+		Processed processedConfig `config:""`
 	}{Processed: processedConfig{processor: processor}}
 	if _, _, err := PopulateStruct(config, provider, scheme); err != nil {
 		t.Errorf("unexpected error: %v", err)
@@ -649,7 +799,7 @@ func Test_populateUnexportedFields(t *testing.T) {
 		inner   innerConfig
 		pointer *innerConfig
 		private
-		Exported innerConfig
+		Exported innerConfig `config:""`
 	}{}
 	config.mu.Lock()
 	defer config.mu.Unlock()
@@ -677,7 +827,13 @@ func Test_populateTaggedUnexportedField(t *testing.T) {
 		"nested": &struct {
 			Inner struct {
 				port int `config:"port"`
-			}
+			} `config:""`
+		}{},
+		"struct": &struct {
+			inner innerConfig `config:""`
+		}{},
+		"pointer": &struct {
+			inner *innerConfig `config:""`
 		}{},
 	}
 	for name, config := range cases {
@@ -1043,8 +1199,8 @@ func Test_populateNestedURL(t *testing.T) {
 		Endpoint url.URL `config:"endpoint"`
 	}
 	config := &struct {
-		Server  serverConfig
-		Pointer *serverConfig
+		Server  serverConfig  `config:""`
+		Pointer *serverConfig `config:""`
 	}{}
 	if _, _, err := PopulateStruct(config, provider, scheme); err != nil {
 		t.Errorf("unexpected error: %v", err)
