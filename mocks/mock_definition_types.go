@@ -53,6 +53,20 @@ func (mr *MockNamingSchemeMockRecorder) Components(propertyName any) *gomock.Cal
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Components", reflect.TypeOf((*MockNamingScheme)(nil).Components), propertyName)
 }
 
+// Compose mocks base method.
+func (m *MockNamingScheme) Compose(components []string) string {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Compose", components)
+	ret0, _ := ret[0].(string)
+	return ret0
+}
+
+// Compose indicates an expected call of Compose.
+func (mr *MockNamingSchemeMockRecorder) Compose(components any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Compose", reflect.TypeOf((*MockNamingScheme)(nil).Compose), components)
+}
+
 // Validate mocks base method.
 func (m *MockNamingScheme) Validate(propertyName string) error {
 	m.ctrl.T.Helper()

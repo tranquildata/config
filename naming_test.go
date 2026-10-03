@@ -138,3 +138,57 @@ func Test_kebabComponents(t *testing.T) {
 		t.Errorf("unexpected components for multi-word name: %v", components)
 	}
 }
+
+func Test_compose(t *testing.T) {
+	cases := map[string]struct {
+		scheme     NamingScheme
+		components []string
+		expected   string
+	}{
+		"camel":         {CamelNamingScheme(), []string{"index", "postgres", "Port"}, "indexPostgresPort"},
+		"camel-lower":   {CamelNamingScheme(), []string{"index", "postgres", "port"}, "indexPostgresPort"},
+		"camel-acronym": {CamelNamingScheme(), []string{"max", "HTTP", "Connections"}, "maxHTTPConnections"},
+		"camel-digits":  {CamelNamingScheme(), []string{"max", "http2", "port"}, "maxHttp2Port"},
+		"camel-unicode": {CamelNamingScheme(), []string{"max", "élan"}, "maxÉlan"},
+		"snake":         {SnakeNamingScheme(), []string{"index", "postgres", "port"}, "index_postgres_port"},
+		"kebab":         {KebabNamingScheme(), []string{"index", "Postgres", "port"}, "index-Postgres-port"},
+	}
+	for name, testCase := range cases {
+		if composed := testCase.scheme.Compose(testCase.components); composed != testCase.expected {
+			t.Errorf("unexpected composed name for %s: %q", name, composed)
+		}
+	}
+
+	// composing no words, or a single word, is well-defined for every scheme
+	for name, scheme := range map[string]NamingScheme{"camel": CamelNamingScheme(), "snake": SnakeNamingScheme(), "kebab": KebabNamingScheme()} {
+		if composed := scheme.Compose(nil); composed != "" {
+			t.Errorf("unexpected composed name for no words with scheme %s: %q", name, composed)
+		}
+		if composed := scheme.Compose([]string{"root"}); composed != "root" {
+			t.Errorf("unexpected composed name for one word with scheme %s: %q", name, composed)
+		}
+		if composed := scheme.Compose([]string{"root", ""}); name == "camel" && composed != "root" {
+			t.Errorf("unexpected composed name with an empty word for scheme %s: %q", name, composed)
+		}
+	}
+}
+
+func Test_composeInvertsComponents(t *testing.T) {
+	// composing the components of a valid name returns that name
+	cases := map[string][]string{
+		"camel": {"a", "root", "rootDirectory", "maxHTTPPort", "maxHttp2Port", "aBC", "parseURLs"},
+		"snake": {"a", "root", "root_directory", "http_2_port"},
+		"kebab": {"a", "A", "root", "root-directory", "Root-Dir", "http-2-port"},
+	}
+	schemes := map[string]NamingScheme{"camel": CamelNamingScheme(), "snake": SnakeNamingScheme(), "kebab": KebabNamingScheme()}
+	for name, propertyNames := range cases {
+		scheme := schemes[name]
+		for _, propertyName := range propertyNames {
+			if err := scheme.Validate(propertyName); err != nil {
+				t.Errorf("invalid test name %q for scheme %s: %v", propertyName, name, err)
+			} else if composed := scheme.Compose(scheme.Components(propertyName)); composed != propertyName {
+				t.Errorf("unexpected round-trip for %q with scheme %s: %q", propertyName, name, composed)
+			}
+		}
+	}
+}

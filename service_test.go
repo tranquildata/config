@@ -1133,6 +1133,10 @@ func (dottedScheme) Components(propertyName string) []string {
 	return strings.Split(propertyName, ".")
 }
 
+func (dottedScheme) Compose(components []string) string {
+	return strings.Join(components, ".")
+}
+
 func (dottedScheme) Validate(propertyName string) error {
 	if !regexp.MustCompile(`^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*$`).MatchString(propertyName) {
 		return fmt.Errorf("property name is invalid: %s", propertyName)
@@ -1155,10 +1159,16 @@ func Test_setupCustomScheme(t *testing.T) {
 		Host  string `config:"http.host"`
 		Port  int    `config:"http.port"`
 		Level string `config:"log.level"`
+		HTTP  struct {
+			Host string `config:"host"`
+			Port int    `config:"port"`
+		} `config:"http"`
 	}{}
 	if err := service.LoadConfig(config); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	} else if config.Host != "filehost" || config.Port != 2000 || config.Level != "debug" {
+		t.Errorf("unexpected populated struct: %+v", *config)
+	} else if config.HTTP.Host != "filehost" || config.HTTP.Port != 2000 {
 		t.Errorf("unexpected populated struct: %+v", *config)
 	}
 

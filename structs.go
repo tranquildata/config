@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net/url"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ const (
 	PrivateTagName      = "hiddenconfig"
 	TagValueSeparator   = ","
 	SliceValueSeparator = ";"
+	SkipTagValue        = "-"
 )
 
 // struct types that we handle as "base types"
@@ -34,11 +36,24 @@ var durationReflectType = reflect.TypeFor[time.Duration]()
 
 // PopulateStruct takes any struct type, and based on the given provider and scheme,
 // attempts to fill in all field-values. The value of configStruct must be a pointer
-// to a struct, not the value itself, or the call will fail. If a field is a base type
-// and is not tagged with either "config" or "hiddenconfig" it will be ignored. If a
-// field is tagged but is un-exported an error is returned. If a field is an exported
-// struct or pointer to a struct then that struct will be recursively populated. Struct
-// fields do not need to be tagged.
+// to a struct, not the value itself, or the call will fail. A field is only populated if
+// it is tagged, and if a tagged field is un-exported an error is returned.
+//
+// A field that is a struct or pointer to a struct opts-in to being recursively populated
+// with a "config" tag, and is skipped with `config:"-"`. An untagged struct field is skipped,
+// which lets config structs hold third-party types like tls.Config, but if the struct's type
+// has tagged fields, directly or through its own untagged struct fields, then an error is
+// returned because the field was most likely meant to be tagged. A struct field may not be
+// tagged with "hiddenconfig".
+//
+// The syntax for a struct field's tag is `config:"PREFIX"`, where the optional PREFIX is a
+// property name that is valid by the rules of the given scheme, and is prepended to the name
+// of every property in the struct using the scheme's Compose(). Prefixes accumulate through
+// nested struct fields. For instance, with the CAMEL scheme a struct tagged `config:"index"`
+// that has a field tagged `config:"postgresPort"` populates the property "indexPostgresPort",
+// so one struct type can be used in several places under different names. A struct field's
+// tag may not include a default value. With an empty tag, `config:""`, the struct's property
+// names are used as-is.
 //
 // The syntax for a tag is `TYPE:"PROPERTYNAME,DEFAULTVALUE"`. The TYPE is either "config"
 // or "hiddenconfig", and the return from this function includes a map from property name to
@@ -52,6 +67,13 @@ var durationReflectType = reflect.TypeFor[time.Duration]()
 // if the value of DEFAULTVALUE is "1;2" then the slice field will have two elements, with
 // values 1 and 2.
 func PopulateStruct(configStruct any, provider Provider, scheme NamingScheme) (map[string]string, map[string]string, error) {
+	return populateStruct(configStruct, provider, scheme, nil)
+}
+
+// populateStruct implements PopulateStruct(), where prefix holds the words that are prepended
+// to the name of every property in the struct, accumulated from the tags of the struct fields
+// that led to it, and is empty for the top-level struct.
+func populateStruct(configStruct any, provider Provider, scheme NamingScheme, prefix []string) (map[string]string, map[string]string, error) {
 	visibleProperties := map[string]string{}
 	hiddenProperties := map[string]string{}
 
@@ -77,7 +99,7 @@ func PopulateStruct(configStruct any, provider Provider, scheme NamingScheme) (m
 		fieldValue := structValue.Field(fieldIndex)
 
 		// attempt to handle the field, stopping if any error occurred
-		if visible, hidden, err := handleField(fieldType, fieldValue, provider, scheme); err != nil {
+		if visible, hidden, err := handleField(fieldType, fieldValue, provider, scheme, prefix); err != nil {
 			return nil, nil, err
 		} else {
 			maps.Copy(visibleProperties, visible)
@@ -99,50 +121,29 @@ func PopulateStruct(configStruct any, provider Provider, scheme NamingScheme) (m
 // property name is valid, and fills in the value based on the provider or the default value if
 // the provider doesn't know the property. It returns maps (in order) for the visible and the
 // hidden fields that were handled, or an error if the field could not be handled for any reason.
-func handleField(fieldType reflect.StructField, fieldValue reflect.Value, provider Provider, scheme NamingScheme) (map[string]string, map[string]string, error) {
+func handleField(fieldType reflect.StructField, fieldValue reflect.Value, provider Provider, scheme NamingScheme, prefix []string) (map[string]string, map[string]string, error) {
+	structType, isStruct := configStructType(fieldType.Type)
+
 	// unexported fields can't be assigned through reflection, so they're skipped entirely,
 	// which lets config structs hold private state like a mutex or third-party types, but
-	// a tagged unexported field is almost certainly a mistake so it's reported
+	// a tagged unexported field is almost certainly a mistake so it's reported .. a struct
+	// field opts-in with an empty tag, so for structs the presence of a tag is enough
 	if !fieldType.IsExported() {
 		for _, tagName := range []string{PublicTagName, PrivateTagName} {
-			if strings.TrimSpace(fieldType.Tag.Get(tagName)) != "" {
+			tagValue, present := fieldType.Tag.Lookup(tagName)
+			tagValue = strings.TrimSpace(tagValue)
+			if (tagValue != "" && tagValue != SkipTagValue) || (isStruct && present && tagValue == "") {
 				return nil, nil, fmt.Errorf("field %s has a %s tag but is not exported", fieldType.Name, tagName)
 			}
 		}
 		return map[string]string{}, map[string]string{}, nil
 	}
 
-	kind := fieldType.Type.Kind()
-
-	// pointers are only supported as a way to reference a struct, so a pointer to any base
-	// type (include the struct "base types" that we handle natively) is rejected
-	if kind == reflect.Pointer {
-		if elemType := fieldType.Type.Elem(); elemType.Kind() != reflect.Struct || baseStructTypes[elemType] {
-			return nil, nil, fmt.Errorf("pointers to base types are not supported for field %s: %s", fieldType.Name, fieldType.Type.String())
-		}
-	}
-
-	// if this field is a struct, or a pointer to a struct, then handle that structure
-	// recursively and continue on to the next field, but only if the struct isn't
-	// a "base type" like Time or URL which we handle directly
-	if (kind == reflect.Pointer || kind == reflect.Struct) && !baseStructTypes[fieldType.Type] {
-		// if this is struct then we just need the address, but if it's a pointer then it hasn't
-		// been allocated so we need to create the struct first
-		var embeddedStruct any
-		if kind == reflect.Struct {
-			embeddedStruct = fieldValue.Addr().Interface()
-		} else {
-			newFieldValue := reflect.New(fieldType.Type.Elem())
-			fieldValue.Set(newFieldValue)
-			embeddedStruct = newFieldValue.Interface()
-		}
-
-		// recurse with the struct, and then skip to the next field
-		if visible, hidden, err := PopulateStruct(embeddedStruct, provider, scheme); err != nil {
-			return nil, nil, err
-		} else {
-			return visible, hidden, nil
-		}
+	// if this field is a struct, or a pointer to a struct, then it's only populated if it
+	// has opted-in with a tag, but only if the struct isn't a "base type" like Time or URL
+	// which we handle directly
+	if isStruct {
+		return handleStructField(fieldType, fieldValue, structType, provider, scheme, prefix)
 	}
 
 	// get the configuration tag, skipping any fields that aren't tagged, and rejecting any
@@ -160,16 +161,29 @@ func handleField(fieldType reflect.StructField, fieldValue reflect.Value, provid
 		return map[string]string{}, map[string]string{}, nil
 	}
 
+	// pointers are only supported as a way to reference a struct, so a pointer to any base
+	// type (include the struct "base types" that we handle natively) is rejected
+	if fieldType.Type.Kind() == reflect.Pointer {
+		return nil, nil, fmt.Errorf("pointers to base types are not supported for field %s: %s", fieldType.Name, fieldType.Type.String())
+	}
+
 	// make sure the tag has a valid set of inputs
 	values := strings.Split(tagValue, TagValueSeparator)
 	if len(values) > 2 {
 		return nil, nil, fmt.Errorf("too many tag inputs for field: %s", fieldType.Name)
 	}
 
-	// check that the property name is valid
+	// check that the property name is valid, and then that it's still valid once any prefix
+	// from the enclosing struct fields has been prepended
 	propertyName := values[0]
 	if err := scheme.Validate(propertyName); err != nil {
 		return nil, nil, err
+	}
+	if len(prefix) > 0 {
+		propertyName = scheme.Compose(append(slices.Clone(prefix), scheme.Components(propertyName)...))
+		if err := scheme.Validate(propertyName); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	// resolvedProperty will hold the map for the single property name & value, and is
@@ -183,14 +197,14 @@ func handleField(fieldType reflect.StructField, fieldValue reflect.Value, provid
 	if len(values) == 2 {
 		defaultValue = values[1]
 		if value, err = fieldToValue(defaultValue, fieldType.Type); err != nil {
-			return nil, nil, fieldValueError("default", fieldType, visible, err)
+			return nil, nil, fieldValueError("default", fieldType, propertyName, visible, err)
 		}
 	}
 
 	// get the provided value, which overrides any default value
 	if providedValue, present := provider.Value(propertyName); present {
 		if value, err = fieldToValue(providedValue, fieldType.Type); err != nil {
-			return nil, nil, fieldValueError("provided", fieldType, visible, err)
+			return nil, nil, fieldValueError("provided", fieldType, propertyName, visible, err)
 		}
 		resolvedProperty = map[string]string{propertyName: providedValue}
 	} else if len(values) == 2 {
@@ -215,13 +229,108 @@ func handleField(fieldType reflect.StructField, fieldValue reflect.Value, provid
 	}
 }
 
-func fieldValueError(source string, fieldType reflect.StructField, visible bool, err error) error {
-	// parsing errors typically include the value being parsed, so for hidden fields only
-	// the expected type is reported to avoid exposing the value in logs or output
-	if visible {
-		return fmt.Errorf("illegal %s value for field %s: %s", source, fieldType.Name, err.Error())
+// handleStructField handles a field that is a struct, or a pointer to a struct, which is not one
+// of the struct "base types". The field is only populated if it's tagged with "config", where a
+// non-empty tag is a prefix for the struct's property names, and skipped if it's tagged with "-".
+// An untagged field is skipped too, unless its type expects config handling, in which case it's
+// an error to leave the choice implicit.
+func handleStructField(fieldType reflect.StructField, fieldValue reflect.Value, structType reflect.Type, provider Provider, scheme NamingScheme, prefix []string) (map[string]string, map[string]string, error) {
+	if _, present := fieldType.Tag.Lookup(PrivateTagName); present {
+		return nil, nil, fmt.Errorf("struct field %s cannot have a %s tag", fieldType.Name, PrivateTagName)
 	}
-	return fmt.Errorf("illegal %s value for hidden field %s: value is not a valid %s", source, fieldType.Name, fieldType.Type.String())
+
+	tagValue, present := fieldType.Tag.Lookup(PublicTagName)
+	if !present {
+		if expectsConfig(structType, map[reflect.Type]bool{}) {
+			return nil, nil, fmt.Errorf("struct field %s has config fields but is not tagged: use `%s:\"\"` to load it or `%s:\"%s\"` to skip it",
+				fieldType.Name, PublicTagName, PublicTagName, SkipTagValue)
+		}
+		return map[string]string{}, map[string]string{}, nil
+	}
+
+	// a struct only names a prefix, so it can't have a default value, and the prefix must be
+	// a valid name on its own before it's added to any prefix from enclosing struct fields
+	tagValue = strings.TrimSpace(tagValue)
+	if tagValue == SkipTagValue {
+		return map[string]string{}, map[string]string{}, nil
+	}
+	if strings.Contains(tagValue, TagValueSeparator) {
+		return nil, nil, fmt.Errorf("struct field %s cannot have a default value", fieldType.Name)
+	}
+	if tagValue != "" {
+		if err := scheme.Validate(tagValue); err != nil {
+			return nil, nil, err
+		}
+		prefix = append(slices.Clone(prefix), scheme.Components(tagValue)...)
+	}
+
+	// if this is struct then we just need the address, but if it's a pointer then it hasn't
+	// been allocated so we need to create the struct first
+	var embeddedStruct any
+	if fieldType.Type.Kind() == reflect.Struct {
+		embeddedStruct = fieldValue.Addr().Interface()
+	} else {
+		newFieldValue := reflect.New(structType)
+		fieldValue.Set(newFieldValue)
+		embeddedStruct = newFieldValue.Interface()
+	}
+
+	return populateStruct(embeddedStruct, provider, scheme, prefix)
+}
+
+// configStructType returns the struct type for a field that is either a struct or a pointer to
+// a struct, and whether the field is one, ignoring the struct "base types" like Time or URL.
+func configStructType(fieldType reflect.Type) (reflect.Type, bool) {
+	if fieldType.Kind() == reflect.Pointer {
+		fieldType = fieldType.Elem()
+	}
+	if fieldType.Kind() != reflect.Struct || baseStructTypes[fieldType] {
+		return nil, false
+	}
+	return fieldType, true
+}
+
+// expectsConfig returns whether the struct type, or any struct it would be populated with if it
+// were tagged, declares config handling. That is, whether any field has a "config" or
+// "hiddenconfig" tag other than a skipped struct, or any untagged exported struct field expects
+// config handling. Visited types are tracked so that self-referencing types terminate.
+func expectsConfig(structType reflect.Type, visited map[reflect.Type]bool) bool {
+	if visited[structType] {
+		return false
+	}
+	visited[structType] = true
+
+	for fieldIndex := 0; fieldIndex < structType.NumField(); fieldIndex++ {
+		field := structType.Field(fieldIndex)
+		nestedType, isStruct := configStructType(field.Type)
+		publicTagValue, publicPresent := field.Tag.Lookup(PublicTagName)
+		privateTagValue, privatePresent := field.Tag.Lookup(PrivateTagName)
+		publicTagValue = strings.TrimSpace(publicTagValue)
+
+		if isStruct {
+			if privatePresent || (publicPresent && publicTagValue != SkipTagValue) {
+				return true
+			}
+			if !publicPresent && field.IsExported() && expectsConfig(nestedType, visited) {
+				return true
+			}
+		} else if publicTagValue != "" || strings.TrimSpace(privateTagValue) != "" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func fieldValueError(source string, fieldType reflect.StructField, propertyName string, visible bool, err error) error {
+	// parsing errors typically include the value being parsed, so for hidden fields only
+	// the expected type is reported to avoid exposing the value in logs or output .. the
+	// property name is included since a struct used in more than one place has the same
+	// field names but different property names
+	if visible {
+		return fmt.Errorf("illegal %s value for field %s (%s): %s", source, fieldType.Name, propertyName, err.Error())
+	}
+	return fmt.Errorf("illegal %s value for hidden field %s (%s): value is not a valid %s", source, fieldType.Name, propertyName, fieldType.Type.String())
 }
 
 // fieldToValue resolves the value of a base type field, returning an error if the
